@@ -33,8 +33,16 @@ namespace hook_stats
     extern std::atomic<uint64_t> g_booleanHits;
     extern std::atomic<uint64_t> g_scalarHits;
     extern std::atomic<uint64_t> g_skeletonCreates;
+    extern std::atomic<uint64_t> g_booleanCreates;
+    extern std::atomic<uint64_t> g_scalarCreates;
+    extern std::atomic<uint64_t> g_hapticCreates;
     extern std::atomic<uint64_t> g_poseUpdates;
     extern std::atomic<uint64_t> g_iobufferWrites;
     extern std::atomic<uint64_t> g_iobufferOpens;
     extern std::atomic<uint64_t> g_genericInterfaceQueries;
 }
+
+// Heartbeat-callable helper that walks the per-handle skeleton hit map and
+// emits a snapshot of known handles + their cumulative hit counts. Defined
+// in InterfaceHookInjector.cpp where the maps and their mutex live.
+void LogSkeletonHandleInventory();

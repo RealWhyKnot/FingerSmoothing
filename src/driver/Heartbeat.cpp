@@ -53,16 +53,24 @@ void Heartbeat::Start()
             if (stopFlag.load()) break;
             seconds += 5;
 
-            LOG("FS-HEARTBEAT t=%ds  skeletal=%llu  boolean=%llu  scalar=%llu  skelCreates=%llu  poseUpdates=%llu  iobufWrites=%llu  iobufOpens=%llu  genericIfaceQueries=%llu",
+            LOG("FS-HEARTBEAT t=%ds  skeletalUpdates=%llu  booleanUpdates=%llu  scalarUpdates=%llu  skelCreates=%llu  boolCreates=%llu  scalarCreates=%llu  hapticCreates=%llu  poseUpdates=%llu  iobufWrites=%llu  iobufOpens=%llu  genericIfaceQueries=%llu",
                 seconds,
                 (unsigned long long)hook_stats::g_skeletalHits.load(),
                 (unsigned long long)hook_stats::g_booleanHits.load(),
                 (unsigned long long)hook_stats::g_scalarHits.load(),
                 (unsigned long long)hook_stats::g_skeletonCreates.load(),
+                (unsigned long long)hook_stats::g_booleanCreates.load(),
+                (unsigned long long)hook_stats::g_scalarCreates.load(),
+                (unsigned long long)hook_stats::g_hapticCreates.load(),
                 (unsigned long long)hook_stats::g_poseUpdates.load(),
                 (unsigned long long)hook_stats::g_iobufferWrites.load(),
                 (unsigned long long)hook_stats::g_iobufferOpens.load(),
                 (unsigned long long)hook_stats::g_genericInterfaceQueries.load());
+
+            // Per-handle inventory: each known component handle and its
+            // cumulative hit count. Two skeleton handles + two pose-device
+            // handles is the expected steady-state for both Index hands.
+            LogSkeletonHandleInventory();
 
             // Module diff: log any module that's new since last tick. The
             // expected interesting one is `driver_indexcontroller.dll`

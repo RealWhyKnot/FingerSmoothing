@@ -30,10 +30,54 @@ namespace hook_stats
     std::atomic<uint64_t> g_booleanHits{0};
     std::atomic<uint64_t> g_scalarHits{0};
     std::atomic<uint64_t> g_skeletonCreates{0};
+    std::atomic<uint64_t> g_booleanCreates{0};
+    std::atomic<uint64_t> g_scalarCreates{0};
+    std::atomic<uint64_t> g_hapticCreates{0};
     std::atomic<uint64_t> g_poseUpdates{0};
     std::atomic<uint64_t> g_iobufferWrites{0};
     std::atomic<uint64_t> g_iobufferOpens{0};
     std::atomic<uint64_t> g_genericInterfaceQueries{0};
+}
+
+// Cache of device-id → serial-number string, populated lazily from the pose
+// detour. Touching VRProperties() on every pose update would be a per-frame
+// API call we don't want; once we know which device id maps to which serial
+// we never need to re-query.
+static std::mutex g_serialCacheMutex;
+static std::unordered_map<uint32_t, std::string> g_deviceSerialCache;
+static std::unordered_map<uint32_t, std::string> g_deviceSystemCache;
+
+static std::string LookupDeviceSerial(uint32_t deviceId)
+{
+    {
+        std::lock_guard<std::mutex> lk(g_serialCacheMutex);
+        auto it = g_deviceSerialCache.find(deviceId);
+        if (it != g_deviceSerialCache.end()) return it->second;
+    }
+    std::string serial = "(?)";
+    if (auto *helpers = vr::VRProperties()) {
+        auto handle = helpers->TrackedDeviceToPropertyContainer(deviceId);
+        if (handle != vr::k_ulInvalidPropertyContainer) {
+            vr::ETrackedPropertyError err = vr::TrackedProp_Success;
+            auto s = helpers->GetStringProperty(handle, vr::Prop_SerialNumber_String, &err);
+            if (err == vr::TrackedProp_Success && !s.empty()) serial = std::move(s);
+            std::string sys;
+            err = vr::TrackedProp_Success;
+            sys = helpers->GetStringProperty(handle, vr::Prop_TrackingSystemName_String, &err);
+            std::lock_guard<std::mutex> lk(g_serialCacheMutex);
+            if (err == vr::TrackedProp_Success && !sys.empty()) g_deviceSystemCache[deviceId] = std::move(sys);
+        }
+    }
+    std::lock_guard<std::mutex> lk(g_serialCacheMutex);
+    g_deviceSerialCache[deviceId] = serial;
+    return serial;
+}
+
+static std::string LookupDeviceSystem(uint32_t deviceId)
+{
+    std::lock_guard<std::mutex> lk(g_serialCacheMutex);
+    auto it = g_deviceSystemCache.find(deviceId);
+    return it != g_deviceSystemCache.end() ? it->second : std::string("(?)");
 }
 
 // ---------------------------------------------------------------------------
@@ -111,6 +155,29 @@ static void LogModuleSnapshot()
     LOG("FS-DIAG ---- end module snapshot ----");
 }
 
+// Hex-dump the first N bytes at `addr`. Used at hook-install time to capture
+// the actual machine-code prologue of each hook target. If the prologue is
+// `E9 XX XX XX XX` (32-bit relative JMP), the function is a thunk that
+// forwards somewhere — meaning our hook is on a thunk and the real
+// implementation is elsewhere; we'd want to follow the JMP and hook that
+// instead. If it's normal-looking code (`48 89 5C 24 ...` typical x64
+// prologue), our hook is on the real function. This single diagnostic
+// distinguishes "hook is on a wrapper that no one else uses" from "hook is
+// on the canonical impl".
+static std::string HexDump(const void *addr, size_t bytes)
+{
+    if (!addr) return "(null)";
+    auto *p = (const unsigned char *)addr;
+    std::string out;
+    out.reserve(bytes * 3);
+    char buf[8];
+    for (size_t i = 0; i < bytes; ++i) {
+        std::snprintf(buf, sizeof buf, "%02X ", p[i]);
+        out += buf;
+    }
+    return out;
+}
+
 // Pretty-print "<modulename>+0xOFFSET" for an address, given a fresh module
 // snapshot. Fallback "<raw 0xADDR>" if the address isn't in any known module.
 static std::string AddressDisplay(void *p)
@@ -162,8 +229,11 @@ static Hook<void(*)(vr::IVRServerDriverHost *, uint32_t, const vr::DriverPose_t 
 //   5 CreateSkeletonComponent
 //   6 UpdateSkeletonComponent
 // ---------------------------------------------------------------------------
+static constexpr int kCreateBooleanComponentVTableIndex  = 0;
 static constexpr int kUpdateBooleanComponentVTableIndex  = 1;
+static constexpr int kCreateScalarComponentVTableIndex   = 2;
 static constexpr int kUpdateScalarComponentVTableIndex   = 3;
+static constexpr int kCreateHapticComponentVTableIndex   = 4;
 static constexpr int kCreateSkeletonComponentVTableIndex = 5;
 static constexpr int kUpdateSkeletonComponentVTableIndex = 6;
 
@@ -175,6 +245,19 @@ static Hook<vr::EVRInputError(*)(vr::IVRDriverInput *, vr::VRInputComponentHandl
     UpdateScalarComponentHook("IVRDriverInput003::UpdateScalarComponent");
 static Hook<vr::EVRInputError(*)(vr::IVRDriverInput *, vr::PropertyContainerHandle_t, const char *, const char *, const char *, vr::EVRSkeletalTrackingLevel, const vr::VRBoneTransform_t *, uint32_t, vr::VRInputComponentHandle_t *)>
     CreateSkeletonComponentHook("IVRDriverInput003::CreateSkeletonComponent");
+
+// Create*Component hooks. Index's controller driver registers its input
+// components ONCE at activation. Whichever Create* methods we see fire tell
+// us which subset of IVRDriverInput Index actually uses on our wrapper. If
+// any Create* fires, IVRDriverInput is at least partially shared. If none
+// do (matching the round-1 result), confirms the per-driver-wrapper
+// hypothesis.
+static Hook<vr::EVRInputError(*)(vr::IVRDriverInput *, vr::PropertyContainerHandle_t, const char *, vr::VRInputComponentHandle_t *)>
+    CreateBooleanComponentHook("IVRDriverInput003::CreateBooleanComponent");
+static Hook<vr::EVRInputError(*)(vr::IVRDriverInput *, vr::PropertyContainerHandle_t, const char *, vr::VRInputComponentHandle_t *, vr::EVRScalarType, vr::EVRScalarUnits)>
+    CreateScalarComponentHook("IVRDriverInput003::CreateScalarComponent");
+static Hook<vr::EVRInputError(*)(vr::IVRDriverInput *, vr::PropertyContainerHandle_t, const char *, vr::VRInputComponentHandle_t *)>
+    CreateHapticComponentHook("IVRDriverInput003::CreateHapticComponent");
 
 // ---------------------------------------------------------------------------
 // IVRIOBuffer vtable layout (openvr_driver.h):
@@ -209,8 +292,11 @@ static void DetourTrackedDevicePoseUpdated005(vr::IVRServerDriverHost *_this, ui
         log = ShouldLogThrottled(g_poseCallCounts[unWhichDevice]);
     }
     if (log) {
-        LOG("FS-M1 TrackedDevicePoseUpdated005: device=%u poseValid=%d trackingResult=%d",
-            unWhichDevice, (int)newPose.poseIsValid, (int)newPose.result);
+        std::string serial = LookupDeviceSerial(unWhichDevice);
+        std::string sys    = LookupDeviceSystem(unWhichDevice);
+        LOG("FS-M1 TrackedDevicePoseUpdated005: device=%u serial=%s system=%s poseValid=%d trackingResult=%d",
+            unWhichDevice, serial.c_str(), sys.c_str(),
+            (int)newPose.poseIsValid, (int)newPose.result);
     }
     TrackedDevicePoseUpdatedHook005.originalFunc(_this, unWhichDevice, newPose, unPoseStructSize);
 }
@@ -224,8 +310,11 @@ static void DetourTrackedDevicePoseUpdated006(vr::IVRServerDriverHost *_this, ui
         log = ShouldLogThrottled(g_poseCallCounts[unWhichDevice]);
     }
     if (log) {
-        LOG("FS-M1 TrackedDevicePoseUpdated006: device=%u poseValid=%d trackingResult=%d",
-            unWhichDevice, (int)newPose.poseIsValid, (int)newPose.result);
+        std::string serial = LookupDeviceSerial(unWhichDevice);
+        std::string sys    = LookupDeviceSystem(unWhichDevice);
+        LOG("FS-M1 TrackedDevicePoseUpdated006: device=%u serial=%s system=%s poseValid=%d trackingResult=%d",
+            unWhichDevice, serial.c_str(), sys.c_str(),
+            (int)newPose.poseIsValid, (int)newPose.result);
     }
     TrackedDevicePoseUpdatedHook006.originalFunc(_this, unWhichDevice, newPose, unPoseStructSize);
 }
@@ -321,6 +410,57 @@ static vr::EVRInputError DetourCreateSkeletonComponent(
     return result;
 }
 
+static vr::EVRInputError DetourCreateBooleanComponent(
+    vr::IVRDriverInput *_this,
+    vr::PropertyContainerHandle_t ulContainer,
+    const char *pchName,
+    vr::VRInputComponentHandle_t *pHandle)
+{
+    auto result = CreateBooleanComponentHook.originalFunc(_this, ulContainer, pchName, pHandle);
+    hook_stats::g_booleanCreates.fetch_add(1, std::memory_order_relaxed);
+    LOG("FS-M1 CreateBooleanComponent: container=%llu name=%s -> handle=%llu err=%d",
+        (unsigned long long)ulContainer,
+        pchName ? pchName : "(null)",
+        (unsigned long long)(pHandle ? *pHandle : 0),
+        (int)result);
+    return result;
+}
+
+static vr::EVRInputError DetourCreateScalarComponent(
+    vr::IVRDriverInput *_this,
+    vr::PropertyContainerHandle_t ulContainer,
+    const char *pchName,
+    vr::VRInputComponentHandle_t *pHandle,
+    vr::EVRScalarType eType,
+    vr::EVRScalarUnits eUnits)
+{
+    auto result = CreateScalarComponentHook.originalFunc(_this, ulContainer, pchName, pHandle, eType, eUnits);
+    hook_stats::g_scalarCreates.fetch_add(1, std::memory_order_relaxed);
+    LOG("FS-M1 CreateScalarComponent: container=%llu name=%s type=%d units=%d -> handle=%llu err=%d",
+        (unsigned long long)ulContainer,
+        pchName ? pchName : "(null)",
+        (int)eType, (int)eUnits,
+        (unsigned long long)(pHandle ? *pHandle : 0),
+        (int)result);
+    return result;
+}
+
+static vr::EVRInputError DetourCreateHapticComponent(
+    vr::IVRDriverInput *_this,
+    vr::PropertyContainerHandle_t ulContainer,
+    const char *pchName,
+    vr::VRInputComponentHandle_t *pHandle)
+{
+    auto result = CreateHapticComponentHook.originalFunc(_this, ulContainer, pchName, pHandle);
+    hook_stats::g_hapticCreates.fetch_add(1, std::memory_order_relaxed);
+    LOG("FS-M1 CreateHapticComponent: container=%llu name=%s -> handle=%llu err=%d",
+        (unsigned long long)ulContainer,
+        pchName ? pchName : "(null)",
+        (unsigned long long)(pHandle ? *pHandle : 0),
+        (int)result);
+    return result;
+}
+
 static vr::EIOBufferError DetourIOBufferOpen(
     vr::IVRIOBuffer *_this,
     const char *pchPath,
@@ -367,28 +507,89 @@ static void TryInstallSkeletalHooks(void *iface)
 {
     if (!iface) return;
     void **vtable = *((void ***)iface);
+
+    // Full vtable scan + first-bytes disassembly for every entry. The
+    // address-display tells us *which module* implements each method; the
+    // hex-dump distinguishes thunks (start with E9 = JMP rel32) from
+    // direct implementations. Both signals together pin down whether our
+    // hook target is the canonical implementation, a per-driver wrapper
+    // that calls a shared impl underneath, or something else.
+    static const char *kIVRDriverInputMethodNames[7] = {
+        "[0] CreateBooleanComponent",
+        "[1] UpdateBooleanComponent",
+        "[2] CreateScalarComponent",
+        "[3] UpdateScalarComponent",
+        "[4] CreateHapticComponent",
+        "[5] CreateSkeletonComponent",
+        "[6] UpdateSkeletonComponent",
+    };
     LOG("FS-DIAG IVRDriverInput pointer=%s vtable=%s",
         AddressDisplay(iface).c_str(), AddressDisplay(vtable).c_str());
-    LOG("FS-DIAG IVRDriverInput vtable[1] UpdateBoolean   = %s", AddressDisplay(vtable[1]).c_str());
-    LOG("FS-DIAG IVRDriverInput vtable[3] UpdateScalar    = %s", AddressDisplay(vtable[3]).c_str());
-    LOG("FS-DIAG IVRDriverInput vtable[5] CreateSkeleton  = %s", AddressDisplay(vtable[5]).c_str());
-    LOG("FS-DIAG IVRDriverInput vtable[6] UpdateSkeleton  = %s", AddressDisplay(vtable[6]).c_str());
+    for (int i = 0; i < 7; ++i) {
+        LOG("FS-DIAG IVRDriverInput vtable%s = %s  bytes={%s}",
+            kIVRDriverInputMethodNames[i],
+            AddressDisplay(vtable[i]).c_str(),
+            HexDump(vtable[i], 16).c_str());
+    }
 
-    if (!IHook::Exists(UpdateSkeletonComponentHook.name)) {
-        UpdateSkeletonComponentHook.CreateHookInObjectVTable(iface, kUpdateSkeletonComponentVTableIndex, &DetourUpdateSkeletonComponent);
-        IHook::Register(&UpdateSkeletonComponentHook);
+    if (!IHook::Exists(CreateBooleanComponentHook.name)) {
+        CreateBooleanComponentHook.CreateHookInObjectVTable(iface, kCreateBooleanComponentVTableIndex, &DetourCreateBooleanComponent);
+        IHook::Register(&CreateBooleanComponentHook);
     }
     if (!IHook::Exists(UpdateBooleanComponentHook.name)) {
         UpdateBooleanComponentHook.CreateHookInObjectVTable(iface, kUpdateBooleanComponentVTableIndex, &DetourUpdateBooleanComponent);
         IHook::Register(&UpdateBooleanComponentHook);
     }
+    if (!IHook::Exists(CreateScalarComponentHook.name)) {
+        CreateScalarComponentHook.CreateHookInObjectVTable(iface, kCreateScalarComponentVTableIndex, &DetourCreateScalarComponent);
+        IHook::Register(&CreateScalarComponentHook);
+    }
     if (!IHook::Exists(UpdateScalarComponentHook.name)) {
         UpdateScalarComponentHook.CreateHookInObjectVTable(iface, kUpdateScalarComponentVTableIndex, &DetourUpdateScalarComponent);
         IHook::Register(&UpdateScalarComponentHook);
     }
+    if (!IHook::Exists(CreateHapticComponentHook.name)) {
+        CreateHapticComponentHook.CreateHookInObjectVTable(iface, kCreateHapticComponentVTableIndex, &DetourCreateHapticComponent);
+        IHook::Register(&CreateHapticComponentHook);
+    }
     if (!IHook::Exists(CreateSkeletonComponentHook.name)) {
         CreateSkeletonComponentHook.CreateHookInObjectVTable(iface, kCreateSkeletonComponentVTableIndex, &DetourCreateSkeletonComponent);
         IHook::Register(&CreateSkeletonComponentHook);
+    }
+    if (!IHook::Exists(UpdateSkeletonComponentHook.name)) {
+        UpdateSkeletonComponentHook.CreateHookInObjectVTable(iface, kUpdateSkeletonComponentVTableIndex, &DetourUpdateSkeletonComponent);
+        IHook::Register(&UpdateSkeletonComponentHook);
+    }
+}
+
+// Heartbeat-callable: dump the per-handle skeletal & scalar hit maps so each
+// 5s tick lets us correlate which specific component handles are active. If
+// we see two distinct skeletal handles with non-zero hits, that's both Index
+// hands publishing through our wrapper (per-driver-wrapper hypothesis is
+// FALSE in that case).
+void LogSkeletonHandleInventory()
+{
+    std::lock_guard<std::mutex> lk(g_handleCountsMutex);
+    if (g_skeletalCallCounts.empty()
+     && g_booleanCallCounts.empty()
+     && g_scalarCallCounts.empty()
+     && g_iobufferWriteCounts.empty()) return;
+
+    for (auto const &kv : g_skeletalCallCounts) {
+        LOG("FS-INV skeletal handle=%llu hits=%llu",
+            (unsigned long long)kv.first, (unsigned long long)kv.second);
+    }
+    for (auto const &kv : g_booleanCallCounts) {
+        LOG("FS-INV boolean  handle=%llu hits=%llu",
+            (unsigned long long)kv.first, (unsigned long long)kv.second);
+    }
+    for (auto const &kv : g_scalarCallCounts) {
+        LOG("FS-INV scalar   handle=%llu hits=%llu",
+            (unsigned long long)kv.first, (unsigned long long)kv.second);
+    }
+    for (auto const &kv : g_iobufferWriteCounts) {
+        LOG("FS-INV iobuf    handle=%llu hits=%llu",
+            (unsigned long long)kv.first, (unsigned long long)kv.second);
     }
 }
 
@@ -398,8 +599,10 @@ static void TryInstallIOBufferHooks(void *iface)
     void **vtable = *((void ***)iface);
     LOG("FS-DIAG IVRIOBuffer pointer=%s vtable=%s",
         AddressDisplay(iface).c_str(), AddressDisplay(vtable).c_str());
-    LOG("FS-DIAG IVRIOBuffer vtable[0] Open  = %s", AddressDisplay(vtable[0]).c_str());
-    LOG("FS-DIAG IVRIOBuffer vtable[3] Write = %s", AddressDisplay(vtable[3]).c_str());
+    LOG("FS-DIAG IVRIOBuffer vtable[0] Open  = %s  bytes={%s}",
+        AddressDisplay(vtable[0]).c_str(), HexDump(vtable[0], 16).c_str());
+    LOG("FS-DIAG IVRIOBuffer vtable[3] Write = %s  bytes={%s}",
+        AddressDisplay(vtable[3]).c_str(), HexDump(vtable[3], 16).c_str());
 
     if (!IHook::Exists(IOBufferOpenHook.name)) {
         IOBufferOpenHook.CreateHookInObjectVTable(iface, kIOBufferOpenVTableIndex, &DetourIOBufferOpen);
