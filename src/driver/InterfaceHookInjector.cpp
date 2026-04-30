@@ -469,11 +469,17 @@ void InjectHooks(ServerTrackedDeviceProvider *driver, vr::IVRDriverContext *pDri
             AddressDisplay(ctxVtable[0]).c_str());
     }
 
+    // MH_ERROR_ALREADY_INITIALIZED is fine — it just means another driver in
+    // vrserver.exe already called MH_Initialize (typically SpaceCalibrator,
+    // which loads alongside us if both drivers are installed). The MinHook
+    // runtime is process-global so initialising twice is a no-op; we can
+    // proceed to install our hooks against the shared runtime.
     auto err = MH_Initialize();
-    if (err != MH_OK) {
-        LOG("MH_Initialize error: %s", MH_StatusToString(err));
+    if (err != MH_OK && err != MH_ERROR_ALREADY_INITIALIZED) {
+        LOG("MH_Initialize hard error (%s); aborting hook install", MH_StatusToString(err));
         return;
     }
+    LOG("FS-DIAG MH_Initialize: %s", MH_StatusToString(err));
 
     // Install GetGenericInterface detour FIRST so subsequent SDK accessor
     // calls (vr::VRDriverInput, vr::VRIOBuffer, vr::VRServerDriverHost) flow
@@ -506,6 +512,12 @@ void InjectHooks(ServerTrackedDeviceProvider *driver, vr::IVRDriverContext *pDri
 
 void DisableHooks()
 {
+    // Tear down OUR hooks only. We deliberately do NOT call MH_Uninitialize:
+    // the MinHook runtime is process-global, and another driver in
+    // vrserver.exe (e.g. SpaceCalibrator) may still be using it. Uninitialize
+    // would remove ALL hooks process-wide — silently breaking any neighbour
+    // who hooked something. IHook::DestroyAll only removes the hooks we
+    // registered with our IHook bookkeeping, leaving the runtime intact for
+    // anyone else still attached.
     IHook::DestroyAll();
-    MH_Uninitialize();
 }
