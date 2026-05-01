@@ -110,6 +110,22 @@ jobs:
           Write-Host "Installer: $named"
           Write-Host "SHA256: $hash"
 
+      - name: Generate auto-changelog
+        id: changelog
+        shell: pwsh
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          $body = & ./.github/scripts/Generate-ReleaseNotes.ps1
+          if (-not $body) { $body = '' }
+          # Multi-line outputs require the heredoc form. Unique delimiter so a
+          # stray "EOF" inside the body can't terminate it early.
+          $delim = "EOF_" + [Guid]::NewGuid().ToString('N')
+          "body<<$delim" >> $env:GITHUB_OUTPUT
+          $body          >> $env:GITHUB_OUTPUT
+          $delim         >> $env:GITHUB_OUTPUT
+
       - name: Locate release zip
         id: zip
         shell: pwsh
@@ -135,6 +151,9 @@ jobs:
           $installer  = "${{ steps.installer.outputs.path }}"
           $instSha    = "${{ steps.installer.outputs.sha256 }}"
           $instName   = "${{ steps.installer.outputs.name }}"
+          $auto   = @'
+          ${{ steps.changelog.outputs.body }}
+          '@
           $notes  = @"
           ## FingerSmoothing $tag
 
@@ -146,5 +165,9 @@ jobs:
           SHA256:
           - ${instName}: ``${instSha}``
           - ${zipName}: ``${zipSha}``
+
+          ---
+
+          $auto
           "@
           gh release create $tag $zip $installer --title $tag --notes $notes
